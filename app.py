@@ -524,7 +524,7 @@ def main():
             st.info(f"Pick at least one {granularity.lower()[:-2] if granularity != 'Daily' else 'day'} in the sidebar to compare.")
             return
 
-        selected_keys = [period_map[label] for label in selected_labels]
+        selected_keys = sorted(period_map[label] for label in selected_labels)
         summary_df = build_period_summary(full_df, selected_keys, granularity)
 
         if summary_df.empty:
