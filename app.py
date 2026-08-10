@@ -10,12 +10,20 @@ Run locally:
 """
 
 import io
+import copy
 from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle,
+)
 
 # --------------------------------------------------------------------------
 # Config
@@ -185,7 +193,10 @@ def clean_data(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
 # Chart builders
 # --------------------------------------------------------------------------
 
-def kpi_row(df: pd.DataFrame):
+def kpi_row(df: pd.DataFrame) -> dict:
+    """Renders the KPI metric row and returns the computed values as a
+    dict, so the same numbers can be reused in the PDF export without
+    recalculating them."""
     total_reg = df.get("registrations", pd.Series(dtype=float)).sum()
     total_booked = df.get("tickets_booked", pd.Series(dtype=float)).sum()
     total_invested = df.get("tickets_invested", pd.Series(dtype=float)).sum()
@@ -200,9 +211,18 @@ def kpi_row(df: pd.DataFrame):
     cols[0].metric("Total Registrations", f"{total_reg:,.0f}")
     cols[1].metric("Tickets Booked", f"{total_booked:,.0f}")
     cols[2].metric("Tickets Invested", f"{total_invested:,.0f}")
-    cols[3].metric("Investment Value", f"৳{total_value:,.0f}")
+    cols[3].metric("Investment Value", f"Tk {total_value:,.0f}")
     cols[4].metric("Reg → Invested Conv.", f"{conversion_rate:.1f}%")
     cols[5].metric("New Investor Mix", f"{new_investor_pct:.1f}%")
+
+    return {
+        "Total Registrations": f"{total_reg:,.0f}",
+        "Tickets Booked": f"{total_booked:,.0f}",
+        "Tickets Invested": f"{total_invested:,.0f}",
+        "Investment Value": f"Tk {total_value:,.0f}",
+        "Reg → Invested Conversion": f"{conversion_rate:.1f}%",
+        "New Investor Mix": f"{new_investor_pct:.1f}%",
+    }
 
 
 def funnel_chart(df: pd.DataFrame):
@@ -264,13 +284,15 @@ def investor_mix_donut(df: pd.DataFrame):
         hole=0.5,
         marker=dict(colors=["#55A868", "#8C8C8C"]),
         textinfo="label+percent+value",
+        domain=dict(x=[0, 1], y=[0, 0.82]),  # reserve top ~18% so outside labels never collide with the title
     ))
     fig.update_layout(
-        title="New vs Old Investor Mix (Period Total)",
-        height=380,
+        title=dict(text="New vs Old Investor Mix (Period Total)", y=0.98, yanchor="top"),
+        height=440,
+        margin=dict(t=70, b=30),
         annotations=[dict(
             text=f"{total_unique:,.0f}<br>Total",
-            x=0.5, y=0.5,
+            x=0.5, y=0.41,
             font_size=20,
             showarrow=False,
         )],
@@ -293,16 +315,18 @@ def investment_vs_target_chart(df: pd.DataFrame, monthly_target: float):
     if monthly_target > 0:
         fig.add_hline(
             y=monthly_target, line_dash="dash", line_color="red",
-            annotation_text=f"Target: ৳{monthly_target:,.0f}", annotation_position="top left",
+            annotation_text=f"Target: Tk {monthly_target:,.0f}", annotation_position="top left",
         )
-    fig.update_layout(title="Cumulative Investment Value vs Monthly Target", xaxis_title="Day", yaxis_title="Value (৳)", height=400)
+    fig.update_layout(title="Cumulative Investment Value vs Monthly Target", xaxis_title="Day", yaxis_title="Value (Tk)", height=400)    
     return fig
 
 
 def payables_chart(df: pd.DataFrame):
     if "payables" not in df.columns or df["payables"].dropna().empty:
         return None
-    fig = px.bar(df, x="day", y="payables", title="Payables (Daily)")
+    # Explicit color - see note in period_investment_comparison_chart on
+    # why px charts need an explicit color to export correctly as PDF images.
+    fig = px.bar(df, x="day", y="payables", title="Payables (Daily)", color_discrete_sequence=["#C44E52"])
     fig.update_layout(height=350)
     return fig
 
@@ -408,8 +432,18 @@ def period_investment_comparison_chart(summary_df: pd.DataFrame, granularity: st
     """Bar chart comparing total Investment Value across selected periods."""
     if "investment_value" not in summary_df.columns:
         return None
-    fig = px.bar(summary_df, x="period_label", y="investment_value", title=f"Investment Value Comparison Across {granularity} Periods")
-    fig.update_layout(height=420, xaxis_title=granularity[:-2] if granularity != "Daily" else "Day", yaxis_title="Investment Value (৳)")
+    # Explicit color instead of px.bar's default colorway - Streamlit
+    # registers its own 'streamlit' plotly template globally, which only
+    # resolves to real colors inside a live browser session. Relying on
+    # the default colorway here would silently bake in broken placeholder
+    # colors (renders as solid black) whenever the chart is exported to a
+    # static image outside that context, e.g. for the PDF report.
+    fig = px.bar(
+        summary_df, x="period_label", y="investment_value",
+        title=f"Investment Value Comparison Across {granularity} Periods",
+        color_discrete_sequence=["#4C72B0"],
+    )
+    fig.update_layout(height=420, xaxis_title=granularity[:-2] if granularity != "Daily" else "Day", yaxis_title="Investment Value (Tk)")
     return fig
 
 
@@ -426,6 +460,110 @@ def period_investor_mix_comparison_chart(summary_df: pd.DataFrame, granularity: 
         height=420, xaxis_title=granularity[:-2] if granularity != "Daily" else "Day", yaxis_title="Unique Investors",
     )
     return fig
+
+
+# --------------------------------------------------------------------------
+# PDF export
+# --------------------------------------------------------------------------
+
+def generate_pdf_report(title: str, subtitle: str, kpi_dict: dict, figures: list, table_df: pd.DataFrame = None) -> bytes:
+    """Builds a printable PDF: title, KPI summary table, each chart as a
+    static image (via kaleido), and an optional data table at the end.
+    Returns raw PDF bytes for use with st.download_button."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=0.6 * inch, bottomMargin=0.6 * inch)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph(title, styles["Title"]))
+    story.append(Paragraph(subtitle, styles["Normal"]))
+    story.append(Paragraph(f"Generated: {datetime.now().strftime('%d %b %Y, %I:%M %p')}", styles["Normal"]))
+    story.append(Spacer(1, 0.25 * inch))
+
+    # KPI summary table
+    if kpi_dict:
+        kpi_rows = [["Metric", "Value"]] + [[k, v] for k, v in kpi_dict.items()]
+        kpi_table = Table(kpi_rows, colWidths=[3 * inch, 2.5 * inch])
+        kpi_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4C72B0")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F2F2")]),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(kpi_table)
+        story.append(Spacer(1, 0.3 * inch))
+
+    # Charts - each rendered to a static PNG via kaleido, then embedded
+    page_width = A4[0] - 1.2 * inch
+    for fig in figures:
+        if fig is None:
+            continue
+        try:
+            # Work on a copy with wider margins for export - funnel/donut
+            # labels can sit close to the edge and get clipped at fixed
+            # export width otherwise. The on-screen Streamlit chart (which
+            # auto-sizes to its container) is untouched by this.
+            export_fig = copy.deepcopy(fig)
+            # Force a real, standalone template - Streamlit registers its
+            # own 'streamlit' theme template globally on import, which only
+            # resolves to real colors inside a live browser session. Static
+            # image export via kaleido happens outside that context, so
+            # without this the chart renders with broken placeholder colors
+            # (solid black bars instead of the intended palette).
+            export_fig.update_layout(template="plotly_white", margin=dict(l=180, r=60, t=60, b=60))
+            png_bytes = export_fig.to_image(format="png", width=1100, height=550, scale=2)
+            img = RLImage(io.BytesIO(png_bytes), width=page_width, height=page_width * (550 / 1100))
+            story.append(img)
+            story.append(Spacer(1, 0.25 * inch))
+        except Exception as e:
+            story.append(Paragraph(f"[Chart could not be rendered: {e}]", styles["Normal"]))
+
+    # Optional data table (kept compact - only used for comparison summaries,
+    # not the full raw daily table, which could be hundreds of rows)
+    if table_df is not None and not table_df.empty:
+        story.append(Spacer(1, 0.2 * inch))
+        story.append(Paragraph("Summary Table", styles["Heading2"]))
+        table_data = [list(table_df.columns)] + table_df.astype(str).values.tolist()
+        data_table = Table(table_data, repeatRows=1)
+        data_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4C72B0")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ]))
+        story.append(data_table)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def render_pdf_export_section(title: str, subtitle: str, kpi_dict: dict, figures: list, key_prefix: str, table_df: pd.DataFrame = None):
+    """Two-step 'Generate PDF' -> 'Download PDF' UI. PDF is only built when
+    the button is clicked (not on every rerun), since rendering charts to
+    static images via kaleido has a real cost."""
+    st.subheader("Printable Report")
+    generate_clicked = st.button("Generate PDF", key=f"{key_prefix}_generate_pdf")
+
+    session_key = f"{key_prefix}_pdf_bytes"
+    if generate_clicked:
+        with st.spinner("Generating PDF..."):
+            pdf_bytes = generate_pdf_report(title, subtitle, kpi_dict, figures, table_df)
+            st.session_state[session_key] = pdf_bytes
+
+    if session_key in st.session_state:
+        st.download_button(
+            "Download Dashboard as PDF",
+            data=st.session_state[session_key],
+            file_name=f"ir_dashboard_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+            mime="application/pdf",
+            key=f"{key_prefix}_download_pdf",
+        )
 
 
 # --------------------------------------------------------------------------
@@ -524,6 +662,8 @@ def main():
             st.info(f"Pick at least one {granularity.lower()[:-2] if granularity != 'Daily' else 'day'} in the sidebar to compare.")
             return
 
+        # Sort chronologically by the underlying (year, month, ...) key,
+        # not by the order the user clicked them in the multiselect.
         selected_keys = sorted(period_map[label] for label in selected_labels)
         summary_df = build_period_summary(full_df, selected_keys, granularity)
 
@@ -532,15 +672,21 @@ def main():
             return
 
         st.subheader(f"{granularity} Comparison")
-        st.plotly_chart(period_funnel_comparison_chart(summary_df, granularity), use_container_width=True)
+        comparison_figures = []
+
+        funnel_fig = period_funnel_comparison_chart(summary_df, granularity)
+        st.plotly_chart(funnel_fig, use_container_width=True)
+        comparison_figures.append(funnel_fig)
 
         invest_fig = period_investment_comparison_chart(summary_df, granularity)
         if invest_fig:
             st.plotly_chart(invest_fig, use_container_width=True)
+            comparison_figures.append(invest_fig)
 
         mix_fig = period_investor_mix_comparison_chart(summary_df, granularity)
         if mix_fig:
             st.plotly_chart(mix_fig, use_container_width=True)
+            comparison_figures.append(mix_fig)
 
         st.divider()
         st.subheader(f"{granularity} Totals")
@@ -548,6 +694,16 @@ def main():
 
         csv = summary_df.to_csv(index=False).encode("utf-8")
         st.download_button(f"Download {granularity.lower()} comparison as CSV", csv, f"ir_{granularity.lower()}_comparison.csv", "text/csv")
+
+        st.divider()
+        render_pdf_export_section(
+            title="WeGro — CF Update Tracker Dashboard",
+            subtitle=f"{granularity} Comparison: {', '.join(selected_labels)}",
+            kpi_dict={},
+            figures=comparison_figures,
+            table_df=summary_df,
+            key_prefix="compare",
+        )
         return  # comparison mode is a distinct view - skip the day-level charts below
 
     if filter_mode == "Date range":
@@ -579,7 +735,7 @@ def main():
 
     st.sidebar.header("Monthly Target")
     monthly_target = st.sidebar.number_input(
-        "Investment value target (৳)", min_value=0.0, value=0.0, step=100000.0,
+                "Investment value target (Tk)", min_value=0.0, value=0.0, step=100000.0,
         help="Enter the monthly investment value target manually. Used for the pacing chart.",
     )
 
@@ -588,30 +744,42 @@ def main():
         return
 
     # KPIs
-    kpi_row(df)
+    kpi_values = kpi_row(df)
     st.divider()
 
-    # Charts
+    # Charts - kept in a list too, so the same figures can be reused in the PDF export
+    report_figures = []
+
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(funnel_chart(df), use_container_width=True)
+        funnel_fig = funnel_chart(df)
+        st.plotly_chart(funnel_fig, use_container_width=True)
+        report_figures.append(funnel_fig)
     with c2:
         donut_fig = investor_mix_donut(df)
         if donut_fig:
             st.plotly_chart(donut_fig, use_container_width=True)
+            report_figures.append(donut_fig)
         else:
             st.info("New/Old investor columns not found in this file.")
 
     mix_fig = investor_mix_chart(df)
     if mix_fig:
         st.plotly_chart(mix_fig, use_container_width=True)
+        report_figures.append(mix_fig)
 
-    st.plotly_chart(trend_chart(df), use_container_width=True)
-    st.plotly_chart(investment_vs_target_chart(df, monthly_target), use_container_width=True)
+    trend_fig = trend_chart(df)
+    st.plotly_chart(trend_fig, use_container_width=True)
+    report_figures.append(trend_fig)
+
+    invest_target_fig = investment_vs_target_chart(df, monthly_target)
+    st.plotly_chart(invest_target_fig, use_container_width=True)
+    report_figures.append(invest_target_fig)
 
     pay_fig = payables_chart(df)
     if pay_fig:
         st.plotly_chart(pay_fig, use_container_width=True)
+        report_figures.append(pay_fig)
 
     st.divider()
     st.subheader("Raw Data")
@@ -619,6 +787,15 @@ def main():
 
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button("Download filtered data as CSV", csv, "ir_daily_filtered.csv", "text/csv")
+
+    st.divider()
+    render_pdf_export_section(
+        title="WeGro — CF Update Tracker Dashboard",
+        subtitle=f"Period: {df['day'].min().strftime('%d %b %Y')} to {df['day'].max().strftime('%d %b %Y')}",
+        kpi_dict=kpi_values,
+        figures=report_figures,
+        key_prefix="daterange",
+    )
 
 
 if __name__ == "__main__":
