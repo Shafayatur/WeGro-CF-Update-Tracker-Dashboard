@@ -389,11 +389,106 @@ def render():
 
     st.divider()
     st.subheader("Investor Master Table")
-    tier_filter_table = st.multiselect("Filter table by tier", TIER_ORDER, default=TIER_ORDER)
-    st.dataframe(final[final["tier"].isin(tier_filter_table)], use_container_width=True)
 
-    csv = final.to_csv(index=False).encode("utf-8")
-    st.download_button("Download investor_segments.csv", csv, "investor_segments.csv", "text/csv")
+    c1, c2 = st.columns(2)
+    with c1:
+        tier_filter_table = st.multiselect("Filter by tier", TIER_ORDER, default=TIER_ORDER, key="seg_tier")
+    with c2:
+        activity_options = ["Active", "Cooling", "Inactive - Reach Out"]
+        status_filter = st.multiselect("Activity status", activity_options, default=activity_options, key="seg_status")
+
+    # Only shown when "Inactive - Reach Out" is part of the selection - lets
+    # IR narrow further within that bucket (e.g. 180+ vs 365+ days) without
+    # a second, disconnected day-threshold control that could disagree
+    # with the status label itself.
+    extra_inactive_days = None
+    if "Inactive - Reach Out" in status_filter:
+        extra_inactive_days = st.number_input(
+            "Within 'Inactive - Reach Out': inactive since at least (days)",
+            min_value=180, value=180, step=30, key="seg_extra_inactive_days",
+            help="180 is the floor for this bucket. Raise it to see only the longest-inactive investors "
+                 "(e.g. 365 for a year or more).",
+        )
+
+    filtered = final[final["tier"].isin(tier_filter_table)]
+    filtered = filtered[filtered["activity_status"].isin(status_filter)]
+    if extra_inactive_days and extra_inactive_days > 180:
+        # Tighten only the Inactive rows - any Active/Cooling rows that
+        # are also selected stay untouched.
+        is_inactive = filtered["activity_status"] == "Inactive - Reach Out"
+        filtered = filtered[~is_inactive | (filtered["days_since_last_investment"] >= extra_inactive_days)]
+
+    with st.expander("Advanced filters"):
+        fc1, fc2, fc3 = st.columns(3)
+
+        with fc1:
+            amt_min = float(final["total_invested"].min())
+            amt_max = float(final["total_invested"].max())
+            amount_range = st.slider(
+                "Total invested (Tk)", min_value=amt_min, max_value=amt_max,
+                value=(amt_min, amt_max), step=max((amt_max - amt_min) / 100, 1.0),
+                key="seg_amount_range",
+            )
+            min_num_investments = st.number_input(
+                "Minimum number of investments", min_value=1, value=1, step=1, key="seg_min_num_investments"
+            )
+
+        with fc2:
+            category_options = sorted(final["favorite_category"].dropna().unique().tolist())
+            category_filter = st.multiselect("Favorite category", category_options, default=[], key="seg_category")
+            tenure_options = sorted(final["preferred_tenure"].dropna().unique().tolist())
+            tenure_filter = st.multiselect("Preferred tenure (months)", tenure_options, default=[], key="seg_tenure")
+
+        with fc3:
+            active_choice = st.selectbox(
+                "Currently active investment?", ["All", "Active only", "No active investment"],
+                key="seg_active_choice",
+            )
+            name_search = st.text_input("Search by name (optional)", "", key="seg_name_search")
+
+        date_c1, date_c2 = st.columns(2)
+        with date_c1:
+            last_range = st.date_input(
+                "Last investment between",
+                value=(final["last_investment"].min().date(), final["last_investment"].max().date()),
+                key="seg_last_range",
+            )
+        with date_c2:
+            first_range = st.date_input(
+                "First investment between",
+                value=(final["first_investment"].min().date(), final["first_investment"].max().date()),
+                key="seg_first_range",
+            )
+
+        # Apply advanced filters on top of the tier/inactivity filter above
+        filtered = filtered[
+            (filtered["total_invested"] >= amount_range[0]) & (filtered["total_invested"] <= amount_range[1])
+        ]
+        filtered = filtered[filtered["num_investments"] >= min_num_investments]
+        if category_filter:
+            filtered = filtered[filtered["favorite_category"].isin(category_filter)]
+        if tenure_filter:
+            filtered = filtered[filtered["preferred_tenure"].isin(tenure_filter)]
+        if active_choice == "Active only":
+            filtered = filtered[filtered["has_active_investment"] == True]
+        elif active_choice == "No active investment":
+            filtered = filtered[filtered["has_active_investment"] == False]
+        if name_search.strip():
+            filtered = filtered[filtered["customer_name"].str.contains(name_search.strip(), case=False, na=False)]
+        if isinstance(last_range, tuple) and len(last_range) == 2:
+            filtered = filtered[
+                (filtered["last_investment"].dt.date >= last_range[0]) & (filtered["last_investment"].dt.date <= last_range[1])
+            ]
+        if isinstance(first_range, tuple) and len(first_range) == 2:
+            filtered = filtered[
+                (filtered["first_investment"].dt.date >= first_range[0]) & (filtered["first_investment"].dt.date <= first_range[1])
+            ]
+
+    st.caption(f"Showing {len(filtered):,} of {len(final):,} investors.")
+    st.dataframe(filtered, use_container_width=True)
+
+    csv = filtered.to_csv(index=False).encode("utf-8")
+    st.download_button("Download filtered investor_segments.csv", csv, "investor_segments.csv", "text/csv")
 
     # VIP/High-tier investors who've gone quiet - the single most
     # actionable list for IR, so it's what goes into the PDF's table
