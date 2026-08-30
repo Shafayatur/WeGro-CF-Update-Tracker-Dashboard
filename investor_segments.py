@@ -142,15 +142,20 @@ def activity_flag(days: float) -> str:
 
 
 def build_investor_summary(df_valid: pd.DataFrame) -> pd.DataFrame:
-    """Cell 4 + Cell 5: one row per investor, with tier assigned."""
+    phone_agg = {"customer_phone": ("customer_phone", "first")} if "customer_phone" in df_valid.columns else {}
+
     summary = df_valid.groupby("customer_unique_id").agg(
         customer_name=("customer_name", "first"),
+        **phone_agg,
         total_invested=("base_grand_total", "sum"),
         num_investments=("id", "count"),
         avg_investment=("base_grand_total", "mean"),
         first_investment=("invested_created_at", "min"),
         last_investment=("invested_created_at", "max"),
     ).reset_index()
+
+    if "customer_phone" not in summary.columns:
+        summary["customer_phone"] = None
 
     summary["tier"] = summary["total_invested"].apply(assign_tier)
     return summary
@@ -185,11 +190,14 @@ def build_final_table(df_valid: pd.DataFrame, investor_summary: pd.DataFrame,
     today_ref = pd.Timestamp.now()
 
     last_project = (
-        df_valid.sort_values("invested_created_at")
-        .groupby("customer_unique_id")
-        .last()[["project_name"]]
-        .rename(columns={"project_name": "last_project_name"})
-    )
+    df_valid.sort_values("invested_created_at")
+    .groupby("customer_unique_id")
+    .last()[["project_name", "tenure"]]
+    .rename(columns={
+        "project_name": "last_project_name",
+        "tenure": "last_project_tenure",
+    })
+)
 
     has_running = (
         df_valid.groupby("customer_unique_id")["status"]
