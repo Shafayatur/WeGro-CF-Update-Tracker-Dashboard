@@ -114,6 +114,17 @@ def preprocess(df: pd.DataFrame, start_date: pd.Timestamp | None) -> pd.DataFram
         df = df[df["order_created_at"] >= start_date].copy()
 
     df["product_category"] = df["project_name"].apply(categorize_product)
+
+    # Maturity date: when did/will this investment's capital become free?
+    # Prefer the real close_date; fall back to invested_created_at + tenure
+    # (months) when close_date is missing, so investors aren't flagged
+    # inactive while their money is still locked in a running investment.
+    df["maturity_date"] = df["close_date"]
+    needs_fallback = df["maturity_date"].isna() & df["invested_created_at"].notna() & df["tenure"].notna()
+    df.loc[needs_fallback, "maturity_date"] = (
+        df.loc[needs_fallback, "invested_created_at"]
+        + pd.to_timedelta(df.loc[needs_fallback, "tenure"].astype(float) * 30, unit="D")
+    )
     return df
 
 
@@ -235,7 +246,14 @@ def build_final_table(df_valid: pd.DataFrame, investor_summary: pd.DataFrame,
     final = final.merge(has_running, on="customer_unique_id", how="left")
     final = final.merge(preferred_tenure, on="customer_unique_id", how="left")
 
-    final["days_since_last_investment"] = (today_ref - final["last_investment"]).dt.days
+    last_maturity = (
+        df_valid.groupby("customer_unique_id")["maturity_date"]
+        .max()
+        .rename("last_maturity_date")
+    )
+    final = final.merge(last_maturity, on="customer_unique_id", how="left")
+
+    final["days_since_last_investment"] = (today_ref - final["last_maturity_date"]).dt.days
     final["activity_status"] = final["days_since_last_investment"].apply(activity_flag)
 
     final["tier"] = pd.Categorical(final["tier"], categories=TIER_ORDER, ordered=True)
