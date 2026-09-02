@@ -134,9 +134,9 @@ def assign_tier(amount: float) -> str:
 def activity_flag(days: float) -> str:
     if pd.isna(days):
         return "Unknown"
-    if days <= 60:
+    if days <= 40:
         return "Active"
-    elif days <= 180:
+    elif days <= 90:
         return "Cooling"
     return "Inactive - Reach Out"
 
@@ -156,6 +156,13 @@ def build_investor_summary(df_valid: pd.DataFrame) -> pd.DataFrame:
 
     if "customer_phone" not in summary.columns:
         summary["customer_phone"] = None
+    else:
+        # Phone column becomes float64 if any investor has a missing number
+        # (NaN forces the whole column to float) - strip the resulting
+        # trailing ".0" so exports show clean phone numbers.
+        summary["customer_phone"] = summary["customer_phone"].apply(
+            lambda x: str(int(x)) if pd.notna(x) else None
+        )
 
     summary["tier"] = summary["total_invested"].apply(assign_tier)
     return summary
@@ -316,6 +323,40 @@ def activity_pie(final: pd.DataFrame):
 # --------------------------------------------------------------------------
 # Streamlit page
 # --------------------------------------------------------------------------
+def render_export_controls(df: pd.DataFrame, key_prefix: str, filename: str,
+                            default_columns: list | None = None):
+    """Row-count + column-selection controls before a CSV download.
+    Reusable across any table in the dashboard - just give each call
+    a unique key_prefix."""
+    st.markdown("**Export options**")
+    ec1, ec2 = st.columns([1, 2])
+
+    with ec1:
+        row_options = ["All"] + list(range(10, 101, 10))
+        row_choice = st.selectbox(
+            "Rows to export", row_options, index=0, key=f"{key_prefix}_row_limit"
+        )
+
+    with ec2:
+        export_cols = st.multiselect(
+            "Columns to export",
+            options=list(df.columns),
+            default=default_columns if default_columns is not None else list(df.columns),
+            key=f"{key_prefix}_export_cols",
+        )
+
+    if not export_cols:
+        st.warning("Select at least one column to export.")
+        return
+
+    export_df = df[export_cols]
+    if row_choice != "All":
+        export_df = export_df.head(int(row_choice))
+
+    csv = export_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        f"Download {filename}", csv, filename, "text/csv", key=f"{key_prefix}_download"
+    )
 
 def render():
     st.title("👥 WeGro — Investor Segmentation")
@@ -394,6 +435,7 @@ def render():
     st.subheader("Best Performing Product + Tenure Combinations")
     combo_top20 = combo_performance.head(20)
     st.dataframe(combo_top20, use_container_width=True)
+    render_export_controls(combo_performance, key_prefix="combo_export", filename="product_tenure_performance.csv")
 
     st.divider()
     st.subheader("Investor Master Table")
@@ -406,21 +448,21 @@ def render():
         status_filter = st.multiselect("Activity status", activity_options, default=activity_options, key="seg_status")
 
     # Only shown when "Inactive - Reach Out" is part of the selection - lets
-    # IR narrow further within that bucket (e.g. 180+ vs 365+ days) without
+    # IR narrow further within that bucket (e.g. 90+ vs 365+ days) without
     # a second, disconnected day-threshold control that could disagree
     # with the status label itself.
     extra_inactive_days = None
     if "Inactive - Reach Out" in status_filter:
         extra_inactive_days = st.number_input(
             "Within 'Inactive - Reach Out': inactive since at least (days)",
-            min_value=180, value=180, step=30, key="seg_extra_inactive_days",
-            help="180 is the floor for this bucket. Raise it to see only the longest-inactive investors "
+            min_value=90, value=90, step=30, key="seg_extra_inactive_days",
+            help="90 is the floor for this bucket. Raise it to see only the longest-inactive investors "
                  "(e.g. 365 for a year or more).",
         )
 
     filtered = final[final["tier"].isin(tier_filter_table)]
     filtered = filtered[filtered["activity_status"].isin(status_filter)]
-    if extra_inactive_days and extra_inactive_days > 180:
+    if extra_inactive_days and extra_inactive_days > 90:
         # Tighten only the Inactive rows - any Active/Cooling rows that
         # are also selected stay untouched.
         is_inactive = filtered["activity_status"] == "Inactive - Reach Out"
@@ -494,9 +536,7 @@ def render():
 
     st.caption(f"Showing {len(filtered):,} of {len(final):,} investors.")
     st.dataframe(filtered, use_container_width=True)
-
-    csv = filtered.to_csv(index=False).encode("utf-8")
-    st.download_button("Download filtered investor_segments.csv", csv, "investor_segments.csv", "text/csv")
+    render_export_controls(filtered, key_prefix="seg_export", filename="investor_segments.csv")
 
     # VIP/High-tier investors who've gone quiet - the single most
     # actionable list for IR, so it's what goes into the PDF's table
@@ -516,7 +556,7 @@ def render():
         kpi_dict=kpi_dict,
         figures=report_figures,
         table_df=outreach_list,
-        table_heading="Priority Outreach — VIP/High Tier, Inactive 180+ Days",
+        table_heading="Priority Outreach — VIP/High Tier, Inactive 90+ Days",
         key_prefix="segments",
         file_prefix="ir_investor_segments",
         landscape_table=True,
