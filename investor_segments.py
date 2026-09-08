@@ -416,6 +416,18 @@ def render():
 
     st.success(f"{len(final):,} investors segmented from {len(df_valid):,} valid investment rows.")
 
+    # Advanced filter date-range widgets keep stale bounds across reruns
+    # because Streamlit only honors `value=` the first time a widget key
+    # is created - it ignores it on every rerun after that, even if the
+    # underlying `final` data has completely changed (e.g. toggling the
+    # start-date filter). Detect that the effective start date changed
+    # and clear the stored widget state so it re-derives from the new data.
+    filter_signature = str(start_date)
+    if st.session_state.get("_seg_filter_signature") != filter_signature:
+        st.session_state.pop("seg_last_range", None)
+        st.session_state.pop("seg_first_range", None)
+        st.session_state["_seg_filter_signature"] = filter_signature
+
     # Report figures/KPIs collected as we go, so the same objects can be
     # reused in the PDF export without recalculating anything - same
     # pattern as the Daily Funnel tab.

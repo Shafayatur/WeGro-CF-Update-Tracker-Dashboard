@@ -31,6 +31,7 @@ EXPECTED_COLUMNS = {
     "new_investors": ["number of new unique investors", "new unique investors"],
     "old_investors": ["number of old unique investors", "old unique investors"],
     "investment_value": ["investment in value (payment)", "investment in value", "investment value"],
+    "reinvestment": ["reinvestment"],
     "payables": ["payables"],
 }
 
@@ -157,11 +158,19 @@ def clean_data(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
     numeric_cols = [
         "registrations", "tickets_booked", "tickets_invested",
         "unique_investors", "new_investors", "old_investors",
-        "investment_value", "payables",
+        "investment_value", "reinvestment", "payables",
     ]
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            # Manually-typed cells sometimes include comma thousand-
+            # separators (e.g. "7,722,295"), which pd.to_numeric can't
+            # parse - it silently becomes NaN with errors="coerce" and
+            # then vanishes from every downstream .sum(), with no error
+            # ever surfacing. Strip commas first so both plain numbers
+            # (720000) and comma-formatted text ("7,722,295") parse the
+            # same way.
+            cleaned = df[col].astype(str).str.replace(",", "", regex=False).str.strip()
+            df[col] = pd.to_numeric(cleaned, errors="coerce")
 
     # Keep only the columns the dashboard actually knows about - anything
     # else in the sheet (target tables, stray notes, extra columns) is
@@ -177,6 +186,18 @@ def clean_data(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
 # Chart builders
 # --------------------------------------------------------------------------
 
+def render_metric_rows(metrics: list, max_per_row: int = 4):
+    """Renders a list of (label, value) pairs as st.metric cards, wrapping
+    into multiple rows of at most `max_per_row` columns each - avoids
+    cramming 6-7 metrics into one line, which truncates labels on
+    narrower screens. Used by both kpi_row() and comparison_kpi_row()."""
+    for i in range(0, len(metrics), max_per_row):
+        chunk = metrics[i:i + max_per_row]
+        cols = st.columns(len(chunk))
+        for col, (label, value) in zip(cols, chunk):
+            col.metric(label, value)
+
+
 def kpi_row(df: pd.DataFrame) -> dict:
     """Renders the KPI metric row and returns the computed values as a
     dict, so the same numbers can be reused in the PDF export without
@@ -191,15 +212,26 @@ def kpi_row(df: pd.DataFrame) -> dict:
     conversion_rate = (total_invested / total_reg * 100) if total_reg else 0
     new_investor_pct = (total_new / total_unique * 100) if total_unique else 0
 
-    cols = st.columns(6)
-    cols[0].metric("Total Registrations", f"{total_reg:,.0f}")
-    cols[1].metric("Tickets Booked", f"{total_booked:,.0f}")
-    cols[2].metric("Tickets Invested", f"{total_invested:,.0f}")
-    cols[3].metric("Investment Value", f"Tk {total_value:,.0f}")
-    cols[4].metric("Reg → Invested Conv.", f"{conversion_rate:.1f}%")
-    cols[5].metric("New Investor Mix", f"{new_investor_pct:.1f}%")
+    # Reinvestment is optional - only present once the IR team's sheet
+    # includes the new column. Kept out of the metrics list when absent
+    # so older files without it still render exactly as before.
+    has_reinvestment = "reinvestment" in df.columns
+    total_reinvestment = df.get("reinvestment", pd.Series(dtype=float)).sum() if has_reinvestment else 0
 
-    return {
+    metrics = [
+        ("Total Registrations", f"{total_reg:,.0f}"),
+        ("Tickets Booked", f"{total_booked:,.0f}"),
+        ("Tickets Invested", f"{total_invested:,.0f}"),
+        ("Investment Value", f"Tk {total_value:,.0f}"),
+        ("Reg → Invested Conv.", f"{conversion_rate:.1f}%"),
+        ("New Investor Mix", f"{new_investor_pct:.1f}%"),
+    ]
+    if has_reinvestment:
+        metrics.append(("Total Reinvestment", f"Tk {total_reinvestment:,.0f}"))
+
+    render_metric_rows(metrics)
+
+    result = {
         "Total Registrations": f"{total_reg:,.0f}",
         "Tickets Booked": f"{total_booked:,.0f}",
         "Tickets Invested": f"{total_invested:,.0f}",
@@ -207,6 +239,9 @@ def kpi_row(df: pd.DataFrame) -> dict:
         "Reg → Invested Conversion": f"{conversion_rate:.1f}%",
         "New Investor Mix": f"{new_investor_pct:.1f}%",
     }
+    if has_reinvestment:
+        result["Total Reinvestment"] = f"Tk {total_reinvestment:,.0f}"
+    return result
 
 
 def funnel_chart(df: pd.DataFrame):
@@ -315,6 +350,18 @@ def payables_chart(df: pd.DataFrame):
     return fig
 
 
+def reinvestment_chart(df: pd.DataFrame):
+    """Reinvestment is typically populated once per month (blank on most
+    days), not a daily-accumulating figure like Investment Value - so this
+    renders as sparse bars, one tall bar on the day it was recorded rather
+    than a continuous series. That sparsity is expected, not a data bug."""
+    if "reinvestment" not in df.columns or df["reinvestment"].dropna().empty:
+        return None
+    fig = px.bar(df, x="day", y="reinvestment", title="Reinvestment (Daily)", color_discrete_sequence=["#D4A017"])
+    fig.update_layout(height=350)
+    return fig
+
+
 def pick_date_from_data(available_days: list, label: str, default_idx: int, key_prefix: str):
     """Year -> Month -> Day dropdown picker (side by side) built only from
     dates that actually exist in the uploaded data. Avoids Streamlit's
@@ -387,11 +434,44 @@ def build_period_summary(full_df: pd.DataFrame, selected_keys: list, granularity
         row = {"period_label": label}
         for col in ["registrations", "tickets_booked", "tickets_invested",
                     "unique_investors", "new_investors", "old_investors",
-                    "investment_value", "payables"]:
+                    "investment_value", "reinvestment", "payables"]:
             if col in period_df.columns:
                 row[col] = period_df[col].sum()
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def compute_derived_metrics(summary_df: pd.DataFrame) -> pd.DataFrame:
+    """Conversion rates, avg ticket size, and unique investors carried
+    through from period totals - kept separate from the raw totals table
+    so that table stays clean; these feed the extra comparison charts."""
+    derived = summary_df[["period_label"]].copy()
+
+    reg = summary_df.get("registrations", pd.Series(0, index=summary_df.index)).replace(0, pd.NA)
+    booked = summary_df.get("tickets_booked", pd.Series(0, index=summary_df.index)).replace(0, pd.NA)
+    invested = summary_df.get("tickets_invested", pd.Series(0, index=summary_df.index)).replace(0, pd.NA)
+    value = summary_df.get("investment_value", pd.Series(0, index=summary_df.index))
+
+    derived["reg_to_booked_pct"] = (summary_df.get("tickets_booked", 0) / reg * 100).fillna(0)
+    derived["booked_to_invested_pct"] = (summary_df.get("tickets_invested", 0) / booked * 100).fillna(0)
+    derived["reg_to_invested_pct"] = (summary_df.get("tickets_invested", 0) / reg * 100).fillna(0)
+    derived["unique_investors"] = summary_df.get("unique_investors", 0)
+    derived["avg_ticket_size"] = (value / invested).fillna(0)
+
+    return derived
+
+
+def build_period_change_table(summary_df: pd.DataFrame):
+    """Period-over-period % change for the core volume/value metrics.
+    Returns None if fewer than 2 periods are selected (nothing to diff)."""
+    if len(summary_df) < 2:
+        return None
+    metrics = [c for c in ["registrations", "tickets_booked", "tickets_invested",
+                            "unique_investors", "investment_value", "reinvestment"] if c in summary_df.columns]
+    change_df = summary_df[["period_label"] + metrics].copy()
+    for m in metrics:
+        change_df[f"{m} Δ%"] = change_df[m].pct_change().mul(100).round(1)
+    return change_df
 
 
 def period_funnel_comparison_chart(summary_df: pd.DataFrame, granularity: str):
@@ -431,6 +511,56 @@ def period_investment_comparison_chart(summary_df: pd.DataFrame, granularity: st
     return fig
 
 
+def period_reinvestment_comparison_chart(summary_df: pd.DataFrame, granularity: str):
+    """Bar chart comparing total Reinvestment across selected periods."""
+    if "reinvestment" not in summary_df.columns or summary_df["reinvestment"].dropna().empty:
+        return None
+    fig = px.bar(
+        summary_df, x="period_label", y="reinvestment",
+        title=f"Reinvestment Comparison Across {granularity} Periods",
+        color_discrete_sequence=["#D4A017"],
+    )
+    fig.update_layout(height=420, xaxis_title=granularity[:-2] if granularity != "Daily" else "Day", yaxis_title="Reinvestment (Tk)")
+    return fig
+
+
+def add_stack_total_labels(fig, x_labels, totals):
+    """Adds a text annotation above each bar in a stacked chart showing the
+    combined total (sum of all segments) - stacked bars only show each
+    segment's own value on hover/inline, not the at-a-glance grand total,
+    so this makes the total readable without hovering."""
+    annotations = list(fig.layout.annotations) if fig.layout.annotations else []
+    for x_val, total in zip(x_labels, totals):
+        annotations.append(dict(
+            x=x_val, y=total, text=f"{total:,.0f}", showarrow=False,
+            yshift=12, font=dict(size=12, color="#FFFFFF"),
+        ))
+    fig.update_layout(annotations=annotations)
+
+
+def period_total_investment_stack_chart(summary_df: pd.DataFrame, granularity: str):
+    """Stacked bar chart: Investment Value + Reinvestment, so each bar's
+    total height is the combined Total Investment for that period - same
+    stacking pattern as the New vs Old Investors chart. Only meaningful
+    when Reinvestment is present (Monthly/Yearly granularity); on Daily
+    granularity Reinvestment has no daily figure, so this quietly returns
+    None rather than showing a misleading single-segment bar."""
+    if "investment_value" not in summary_df.columns:
+        return None
+    if "reinvestment" not in summary_df.columns or summary_df["reinvestment"].dropna().empty:
+        return None
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=summary_df["period_label"], y=summary_df["investment_value"], name="Investment Value", marker_color="#4C72B0"))
+    fig.add_trace(go.Bar(x=summary_df["period_label"], y=summary_df["reinvestment"], name="Reinvestment", marker_color="#D4A017"))
+    fig.update_layout(
+        barmode="stack", title=f"Total Investment (Investment Value + Reinvestment) Across {granularity} Periods",
+        height=420, xaxis_title=granularity[:-2] if granularity != "Daily" else "Day", yaxis_title="Total Investment (Tk)",
+    )
+    totals = summary_df["investment_value"].fillna(0) + summary_df["reinvestment"].fillna(0)
+    add_stack_total_labels(fig, summary_df["period_label"], totals)
+    return fig
+
+
 def period_investor_mix_comparison_chart(summary_df: pd.DataFrame, granularity: str):
     """Stacked bar chart comparing New vs Old Unique Investors across
     selected periods."""
@@ -443,7 +573,90 @@ def period_investor_mix_comparison_chart(summary_df: pd.DataFrame, granularity: 
         barmode="stack", title=f"New vs Old Investors Across {granularity} Periods",
         height=420, xaxis_title=granularity[:-2] if granularity != "Daily" else "Day", yaxis_title="Unique Investors",
     )
+    totals = summary_df["new_investors"].fillna(0) + summary_df["old_investors"].fillna(0)
+    add_stack_total_labels(fig, summary_df["period_label"], totals)
     return fig
+
+
+def period_conversion_rate_chart(derived_df: pd.DataFrame, granularity: str):
+    """Grouped bar comparing funnel-stage conversion rates (%) across
+    selected periods - shows whether the funnel got more/less efficient,
+    not just whether volumes moved."""
+    fig = go.Figure()
+    for col, label, color in [
+        ("reg_to_booked_pct", "Reg → Booked %", "#4C72B0"),
+        ("booked_to_invested_pct", "Booked → Invested %", "#55A868"),
+        ("reg_to_invested_pct", "Reg → Invested %", "#C44E52"),
+    ]:
+        fig.add_trace(go.Bar(x=derived_df["period_label"], y=derived_df[col], name=label, marker_color=color))
+    fig.update_layout(
+        barmode="group", title=f"Funnel Conversion Rates Across {granularity} Periods",
+        height=420, xaxis_title=granularity[:-2] if granularity != "Daily" else "Day", yaxis_title="Conversion %",
+    )
+    return fig
+
+
+def period_unique_investors_chart(derived_df: pd.DataFrame, granularity: str):
+    """Bar chart of total Unique Investors per period - a single clean
+    total line, complementing the existing New vs Old stacked view."""
+    fig = go.Figure(go.Bar(x=derived_df["period_label"], y=derived_df["unique_investors"], marker_color="#4C72B0"))
+    fig.update_layout(
+        title=f"Total Unique Investors Across {granularity} Periods",
+        height=380, xaxis_title=granularity[:-2] if granularity != "Daily" else "Day", yaxis_title="Unique Investors",
+    )
+    return fig
+
+
+def period_avg_ticket_size_chart(derived_df: pd.DataFrame, granularity: str):
+    """Bar chart of average investment value per invested ticket, per
+    period - flags whether investment value growth is from more investors
+    or bigger tickets."""
+    fig = go.Figure(go.Bar(x=derived_df["period_label"], y=derived_df["avg_ticket_size"], marker_color="#D4A017"))
+    fig.update_layout(
+        title=f"Average Ticket Size Across {granularity} Periods",
+        height=380, xaxis_title=granularity[:-2] if granularity != "Daily" else "Day", yaxis_title="Avg Investment Value per Ticket (Tk)",
+    )
+    return fig
+
+
+def comparison_kpi_row(summary_df: pd.DataFrame) -> dict:
+    """KPI cards for Compare Periods mode - aggregated across the selected
+    periods. Mirrors kpi_row()'s pattern for the date-range view, and its
+    return dict feeds the PDF export the same way (previously an empty
+    dict, so comparison-mode PDFs had no KPI cards at all)."""
+    total_reg = summary_df.get("registrations", pd.Series(dtype=float)).sum()
+    total_invested = summary_df.get("tickets_invested", pd.Series(dtype=float)).sum()
+    total_value = summary_df.get("investment_value", pd.Series(dtype=float)).sum()
+    total_unique = summary_df.get("unique_investors", pd.Series(dtype=float)).sum()
+
+    conversion_rate = (total_invested / total_reg * 100) if total_reg else 0
+    avg_ticket = (total_value / total_invested) if total_invested else 0
+
+    has_reinvestment = "reinvestment" in summary_df.columns
+    total_reinvestment = summary_df.get("reinvestment", pd.Series(dtype=float)).sum() if has_reinvestment else 0
+
+    metrics = [
+        ("Total Registrations", f"{total_reg:,.0f}"),
+        ("Total Tickets Invested", f"{total_invested:,.0f}"),
+        ("Total Investment Value", f"Tk {total_value:,.0f}"),
+        ("Overall Conversion", f"{conversion_rate:.1f}%"),
+        ("Avg Ticket Size", f"Tk {avg_ticket:,.0f}"),
+    ]
+    if has_reinvestment:
+        metrics.append(("Total Reinvestment", f"Tk {total_reinvestment:,.0f}"))
+
+    render_metric_rows(metrics, max_per_row=3)
+
+    result = {
+        "Total Registrations": f"{total_reg:,.0f}",
+        "Total Tickets Invested": f"{total_invested:,.0f}",
+        "Total Investment Value": f"Tk {total_value:,.0f}",
+        "Overall Conversion": f"{conversion_rate:.1f}%",
+        "Avg Ticket Size": f"Tk {avg_ticket:,.0f}",
+    }
+    if has_reinvestment:
+        result["Total Reinvestment"] = f"Tk {total_reinvestment:,.0f}"
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -551,26 +764,59 @@ def render():
             st.warning("No data found for the selected periods.")
             return
 
-        st.subheader(f"{granularity} Comparison")
+        st.subheader(f"{granularity} Comparison — Summary")
+        comparison_kpis = comparison_kpi_row(summary_df)
+        derived_df = compute_derived_metrics(summary_df)
+
+        st.divider()
         comparison_figures = []
 
+        st.subheader("Funnel Volume")
         funnel_fig = period_funnel_comparison_chart(summary_df, granularity)
         st.plotly_chart(funnel_fig, use_container_width=True)
         comparison_figures.append(funnel_fig)
 
-        invest_fig = period_investment_comparison_chart(summary_df, granularity)
-        if invest_fig:
-            st.plotly_chart(invest_fig, use_container_width=True)
-            comparison_figures.append(invest_fig)
+        st.subheader("Funnel Efficiency")
+        conv_fig = period_conversion_rate_chart(derived_df, granularity)
+        st.plotly_chart(conv_fig, use_container_width=True)
+        comparison_figures.append(conv_fig)
 
+        st.subheader("Investment")
+        total_invest_fig = period_total_investment_stack_chart(summary_df, granularity)
+        if total_invest_fig:
+            st.plotly_chart(total_invest_fig, use_container_width=True)
+            comparison_figures.append(total_invest_fig)
+        else:
+            invest_fig = period_investment_comparison_chart(summary_df, granularity)
+            if invest_fig:
+                st.plotly_chart(invest_fig, use_container_width=True)
+                comparison_figures.append(invest_fig)
+
+        st.subheader("Investor Mix")
         mix_fig = period_investor_mix_comparison_chart(summary_df, granularity)
         if mix_fig:
             st.plotly_chart(mix_fig, use_container_width=True)
             comparison_figures.append(mix_fig)
 
+        uniq_fig = period_unique_investors_chart(derived_df, granularity)
+        st.plotly_chart(uniq_fig, use_container_width=True)
+        comparison_figures.append(uniq_fig)
+
+        st.subheader("Ticket Economics")
+        ticket_fig = period_avg_ticket_size_chart(derived_df, granularity)
+        st.plotly_chart(ticket_fig, use_container_width=True)
+        comparison_figures.append(ticket_fig)
+
         st.divider()
         st.subheader(f"{granularity} Totals")
         st.dataframe(summary_df, use_container_width=True)
+
+        change_df = build_period_change_table(summary_df)
+        if change_df is not None:
+            st.subheader(f"{granularity}-over-{granularity} % Change")
+            st.dataframe(change_df, use_container_width=True)
+        else:
+            st.caption("Select at least 2 periods to see period-over-period % change.")
 
         csv = summary_df.to_csv(index=False).encode("utf-8")
         st.download_button(f"Download {granularity.lower()} comparison as CSV", csv, f"ir_{granularity.lower()}_comparison.csv", "text/csv")
@@ -579,7 +825,7 @@ def render():
         render_pdf_export_section(
             title="WeGro — CF Update Tracker Dashboard",
             subtitle=f"{granularity} Comparison: {', '.join(selected_labels)}",
-            kpi_dict={},
+            kpi_dict=comparison_kpis,
             figures=comparison_figures,
             table_df=summary_df,
             key_prefix="compare",
@@ -661,6 +907,11 @@ def render():
     if pay_fig:
         st.plotly_chart(pay_fig, use_container_width=True)
         report_figures.append(pay_fig)
+
+    reinvest_fig = reinvestment_chart(df)
+    if reinvest_fig:
+        st.plotly_chart(reinvest_fig, use_container_width=True)
+        report_figures.append(reinvest_fig)
 
     st.divider()
     st.subheader("Raw Data")
